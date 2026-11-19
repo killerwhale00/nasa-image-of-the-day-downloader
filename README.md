@@ -27,6 +27,8 @@ A command-line tool for downloading images from NASA's [Astronomy Picture of the
   pip install Pillow
   ```
 
+for new users make sure to select the folder the file is in (if it is directly in downloads: cd downloads)
+
 ## Quick start
 
 ```bash
