@@ -3,16 +3,31 @@
 NASA Astronomy Picture of the Day (APOD) Downloader
 =====================================================
 
-Downloads images (and metadata) from NASA's APOD API:
-https://api.nasa.gov/
+Downloads images (and metadata) from NASA's APOD Basic JSON feed:
+https://science.nasa.gov/wp-json/wp/v2/apod-basic
+
+MIGRATION NOTE (Nov 2026): NASA retired the old api.nasa.gov/planetary/apod
+endpoint (the one that needed an API key / DEMO_KEY). This version talks to
+the new public science.nasa.gov APOD Basic feed instead. Key differences:
+  - No API key needed at all - the feed is public.
+  - Dates use NASA's legacy YYMMDD code internally (handled for you - you
+    still pass normal YYYY-MM-DD dates on the command line).
+  - The feed exposes only one image rendition (hdurl), so there's no
+    separate HD/SD choice anymore - the --quality flag has been removed.
+  - There's no "random picture" endpoint on NASA's side anymore, so
+    --random now works by sampling random dates since APOD began
+    (1995-06-16) and fetching each one - it's slower than before for
+    large counts, since it's one request per date.
+  - The feed doesn't include a "copyright" field, so that's no longer
+    saved to metadata; a "permalink" to the APOD web page is saved instead.
 
 Features
 --------
 - Fetch today's picture, a specific date, a date range, or N random pictures
-- Choose HD or standard resolution downloads
-- Save metadata (title, explanation, copyright) alongside images as .json/.txt
-- Skips videos gracefully (APOD occasionally features a video instead of an image)
-- Optional filters (fast heuristics, no OCR — require Pillow: pip install Pillow):
+- Save metadata (title, explanation, permalink) alongside images as .json/.txt
+- Skips videos/embeds gracefully (APOD occasionally features a video or
+  iframe embed instead of a plain image)
+- Optional filters (fast heuristics, no OCR - require Pillow: pip install Pillow):
     --exclude-text-images   skip diagrams/star-charts/text-heavy graphics
     --exclude-overexposed   skip blown-out/overly bright images (flares, flashes)
     --exclude-incomplete    skip images with missing/blank mosaic sections
@@ -20,31 +35,25 @@ Features
     --min-resolution        skip images below sd (~640x480) or hd (~1280x720);
                              defaults to hd even if this flag isn't passed at all;
                              use --min-resolution none to disable
-- Supports your own NASA API key, or falls back to the public DEMO_KEY
-  (DEMO_KEY works but is rate-limited to ~30 requests/hour, 50/day)
 - Retries automatically on network timeouts/hiccups
-
-Get a free API key (recommended) at: https://api.nasa.gov/
+- Automatically paginates date ranges to respect NASA's 25-item-per-page cap
 
 Usage examples
 --------------
-  # Today's picture, using DEMO_KEY
+  # Today's picture
   python nasa_apod_downloader.py
-
-  # Use your own API key
-  python nasa_apod_downloader.py --api-key YOUR_KEY_HERE
 
   # A specific date
   python nasa_apod_downloader.py --date 2024-12-25
 
-  # A date range
+  # A date range (automatically paginated)
   python nasa_apod_downloader.py --start-date 2024-12-01 --end-date 2024-12-10
 
-  # 5 random APODs
+  # 5 random APODs (samples random dates since APOD began)
   python nasa_apod_downloader.py --random 5
 
-  # Standard resolution instead of HD, custom output folder, save metadata too
-  python nasa_apod_downloader.py --date 2024-12-25 --quality sd -o ./my_apods --save-metadata
+  # Custom output folder, save metadata too
+  python nasa_apod_downloader.py --date 2024-12-25 -o ./my_apods --save-metadata
 
   # Interactive mode (no arguments needed, will prompt you for everything)
   python nasa_apod_downloader.py --interactive
@@ -72,6 +81,7 @@ import argparse
 import io
 import json
 import os
+import random
 import sys
 import time
 import urllib.request
@@ -79,8 +89,8 @@ import urllib.parse
 import urllib.error
 from datetime import date as _date, timedelta as _timedelta
 
-# Optional dependency for --exclude-text-images. The script works fine without
-# it; that flag just won't be usable until Pillow is installed:
+# Optional dependency for the image-quality filters below. The script works
+# fine without it; those flags just won't be usable until Pillow is installed:
 #   pip install Pillow
 try:
     from PIL import Image, ImageFilter, ImageOps
@@ -88,7 +98,16 @@ try:
 except ImportError:
     PIL_AVAILABLE = False
 
-APOD_ENDPOINT = "https://api.nasa.gov/planetary/apod"
+# NASA's new public APOD Basic JSON feed (replaces api.nasa.gov/planetary/apod).
+APOD_BASE = "https://science.nasa.gov/wp-json/wp/v2/apod-basic"
+
+# The first APOD was published on 1995-06-16. Used as the start of the range
+# we sample random dates from for --random.
+APOD_START_DATE = _date(1995, 6, 16)
+
+# NASA caps per_page at 25 on the list endpoint; date-range requests are
+# paginated automatically to work around this.
+PER_PAGE_MAX = 25
 
 
 def _get_pixel_values(img):
@@ -209,153 +228,27 @@ def looks_incomplete(image_bytes, sample_size=150, tile_size=15,
         return False
 
 
-def _fetch_apod_single_request(api_key, date=None, start_date=None, end_date=None, count=None,
-                                thumbs=True, max_retries=3, timeout=60):
-    """Call the NASA APOD API once and return a list of entry dicts.
+def looks_like_panorama(image_bytes, aspect_ratio_threshold=2.5):
+    """Return True if the image has an extreme aspect ratio, e.g. a rover
+    panorama/mosaic (very wide, often stitched from many frames) rather
+    than a normal photo frame.
 
-    Retries on timeouts/transient network errors before giving up. This
-    issues exactly one HTTP request — use fetch_apod() instead, which
-    chunks large date ranges / counts to respect NASA's 100-item limit
-    per request.
+    Returns False (i.e. "keep it") if Pillow isn't available or the image
+    can't be read, so this never silently blocks a download.
     """
-    params = {"api_key": api_key}
-    if count:
-        params["count"] = count
-    elif start_date and end_date:
-        params["start_date"] = start_date
-        params["end_date"] = end_date
-    elif date:
-        params["date"] = date
-    if thumbs:
-        params["thumbs"] = "true"  # gives a thumbnail URL even for video entries
-
-    url = f"{APOD_ENDPOINT}?{urllib.parse.urlencode(params)}"
-    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (APOD-downloader)"})
-
-    last_error = None
-    for attempt in range(1, max_retries + 1):
-        try:
-            with urllib.request.urlopen(req, timeout=timeout) as resp:
-                data = json.loads(resp.read().decode("utf-8"))
-            if isinstance(data, dict):
-                return [data]
-            return data
-
-        except urllib.error.HTTPError as e:
-            body = e.read().decode("utf-8", errors="ignore")
-            print(f"\n[ERROR] NASA API returned HTTP {e.code}.")
-            try:
-                msg = json.loads(body).get("msg") or json.loads(body).get("error", {}).get("message")
-                if msg:
-                    print(f"        {msg}")
-            except Exception:
-                pass
-            if e.code == 429:
-                print("        You've hit a rate limit. Get your own free API key at https://api.nasa.gov/")
-            sys.exit(1)  # HTTP errors won't be fixed by retrying
-
-        except (urllib.error.URLError, TimeoutError, ConnectionError, OSError) as e:
-            last_error = e
-            reason = getattr(e, "reason", e)
-            if attempt < max_retries:
-                wait = 2 * attempt
-                print(f"[WARN]  Connection issue ({reason}). Retrying in {wait}s "
-                      f"(attempt {attempt}/{max_retries})...")
-                time.sleep(wait)
-            else:
-                print(f"\n[ERROR] Could not reach NASA API after {max_retries} attempts: {reason}")
-                print("        This is usually a network/firewall/antivirus issue, or a slow connection.")
-                print("        Things to try:")
-                print("          - Check your internet connection")
-                print("          - Temporarily disable VPN/antivirus HTTPS scanning and retry")
-                print("          - Try again in a minute (NASA's servers may be briefly slow)")
-                sys.exit(1)
-
-    print(f"\n[ERROR] Failed to fetch data from NASA API: {last_error}")
-    sys.exit(1)
-
-
-# NASA's APOD API rejects date ranges or --count values larger than 100
-# items in a single request. This wrapper transparently splits larger
-# requests into multiple chunked calls and stitches the results together.
-MAX_ITEMS_PER_REQUEST = 100
-
-
-def fetch_apod(api_key, date=None, start_date=None, end_date=None, count=None, thumbs=True,
-                max_retries=3, timeout=60):
-    """Call the NASA APOD API and return a list of entry dicts.
-
-    Automatically splits requests that would exceed NASA's 100-item-per-request
-    limit (large date ranges or --random counts) into multiple chunked calls.
-    """
-    # --- Random count, possibly > 100 ---
-    if count:
-        if count <= MAX_ITEMS_PER_REQUEST:
-            return _fetch_apod_single_request(api_key, count=count, thumbs=thumbs,
-                                               max_retries=max_retries, timeout=timeout)
-
-        results = []
-        remaining = count
-        chunk_num = 0
-        total_chunks = (count + MAX_ITEMS_PER_REQUEST - 1) // MAX_ITEMS_PER_REQUEST
-        while remaining > 0:
-            chunk_num += 1
-            this_count = min(MAX_ITEMS_PER_REQUEST, remaining)
-            print(f"[INFO] Requesting random batch {chunk_num}/{total_chunks} ({this_count} images)...")
-            results.extend(_fetch_apod_single_request(api_key, count=this_count, thumbs=thumbs,
-                                                        max_retries=max_retries, timeout=timeout))
-            remaining -= this_count
-            if remaining > 0:
-                time.sleep(1)  # be polite between chunked requests
-        return results
-
-    # --- Date range, possibly spanning > 100 days ---
-    if start_date and end_date:
-        start = _date.fromisoformat(start_date)
-        end = _date.fromisoformat(end_date)
-        total_days = (end - start).days + 1
-
-        if total_days <= MAX_ITEMS_PER_REQUEST:
-            return _fetch_apod_single_request(api_key, start_date=start_date, end_date=end_date,
-                                               thumbs=thumbs, max_retries=max_retries, timeout=timeout)
-
-        results = []
-        chunk_start = start
-        chunk_num = 0
-        total_chunks = (total_days + MAX_ITEMS_PER_REQUEST - 1) // MAX_ITEMS_PER_REQUEST
-        while chunk_start <= end:
-            chunk_num += 1
-            chunk_end = min(chunk_start + _timedelta(days=MAX_ITEMS_PER_REQUEST - 1), end)
-            print(f"[INFO] Requesting date chunk {chunk_num}/{total_chunks}: "
-                  f"{chunk_start.isoformat()} to {chunk_end.isoformat()}...")
-            results.extend(_fetch_apod_single_request(api_key, start_date=chunk_start.isoformat(),
-                                                        end_date=chunk_end.isoformat(), thumbs=thumbs,
-                                                        max_retries=max_retries, timeout=timeout))
-            chunk_start = chunk_end + _timedelta(days=1)
-            if chunk_start <= end:
-                time.sleep(1)  # be polite between chunked requests
-        return results
-
-    # --- Single date or "today" — always just one item, no chunking needed ---
-    return _fetch_apod_single_request(api_key, date=date, thumbs=thumbs,
-                                       max_retries=max_retries, timeout=timeout)
-
-
-def pick_url(entry, quality):
-    """Pick the best available image URL for an entry given desired quality."""
-    media_type = entry.get("media_type", "image")
-    if media_type != "image":
-        return None  # videos aren't downloadable as images; we'll skip or note them
-
-    if quality == "hd":
-        return entry.get("hdurl") or entry.get("url")
-    return entry.get("url") or entry.get("hdurl")
+    if not PIL_AVAILABLE:
+        return False
+    try:
+        img = Image.open(io.BytesIO(image_bytes))
+        width, height = img.size
+        ratio = max(width / height, height / width)
+        return ratio > aspect_ratio_threshold
+    except Exception:
+        return False
 
 
 # Minimum pixel-count tiers for --min-resolution. Compared against actual
-# width*height of the downloaded image (not the --quality flag, which just
-# picks which URL to request — the source image can still be smaller than
-# expected either way).
+# width*height of the downloaded image.
 RESOLUTION_MIN_PIXELS = {
     "sd": 640 * 480,    # ~307,200 px
     "hd": 1280 * 720,   # ~921,600 px
@@ -379,23 +272,170 @@ def below_min_resolution(image_bytes, min_level="sd"):
         return False
 
 
-def looks_like_panorama(image_bytes, aspect_ratio_threshold=2.5):
-    """Return True if the image has an extreme aspect ratio, e.g. a rover
-    panorama/mosaic (very wide, often stitched from many frames) rather
-    than a normal photo frame.
-
-    Returns False (i.e. "keep it") if Pillow isn't available or the image
-    can't be read, so this never silently blocks a download.
+def _legacy_date_code(d):
+    """Convert a datetime.date to NASA's legacy APOD date code (YYMMDD),
+    which the science.nasa.gov feed still uses for single-date lookups
+    and date_from/date_to filters.
     """
-    if not PIL_AVAILABLE:
-        return False
-    try:
-        img = Image.open(io.BytesIO(image_bytes))
-        width, height = img.size
-        ratio = max(width / height, height / width)
-        return ratio > aspect_ratio_threshold
-    except Exception:
-        return False
+    return d.strftime("%y%m%d")
+
+
+def _http_get_json(url, max_retries=3, timeout=60, allow_404=False):
+    """GET a URL and parse it as JSON, with retries on transient network
+    errors. If allow_404 is True, a 404 response returns None instead of
+    exiting (used for single-date lookups, where a 404 just means nothing
+    was published that day).
+    """
+    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (APOD-downloader)"})
+
+    last_error = None
+    for attempt in range(1, max_retries + 1):
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                return json.loads(resp.read().decode("utf-8"))
+
+        except urllib.error.HTTPError as e:
+            if e.code == 404 and allow_404:
+                return None
+            body = e.read().decode("utf-8", errors="ignore")
+            print(f"\n[ERROR] NASA's APOD feed returned HTTP {e.code}.")
+            try:
+                msg = json.loads(body).get("message")
+                if msg:
+                    print(f"        {msg}")
+            except Exception:
+                pass
+            sys.exit(1)  # HTTP errors (other than an allowed 404) won't be fixed by retrying
+
+        except (urllib.error.URLError, TimeoutError, ConnectionError, OSError) as e:
+            last_error = e
+            reason = getattr(e, "reason", e)
+            if attempt < max_retries:
+                wait = 2 * attempt
+                print(f"[WARN]  Connection issue ({reason}). Retrying in {wait}s "
+                      f"(attempt {attempt}/{max_retries})...")
+                time.sleep(wait)
+            else:
+                print(f"\n[ERROR] Could not reach NASA's APOD feed after {max_retries} attempts: {reason}")
+                print("        This is usually a network/firewall/antivirus issue, or a slow connection.")
+                print("        Things to try:")
+                print("          - Check your internet connection")
+                print("          - Temporarily disable VPN/antivirus HTTPS scanning and retry")
+                print("          - Try again in a minute (NASA's servers may be briefly slow)")
+                sys.exit(1)
+
+    print(f"\n[ERROR] Failed to fetch data from NASA's APOD feed: {last_error}")
+    sys.exit(1)
+
+
+def _normalize_entry(item):
+    """Map a raw science.nasa.gov apod-basic JSON item to the internal
+    entry dict the rest of this script works with.
+    """
+    if not item:
+        return None
+    return {
+        "title": item.get("title") or "Untitled",
+        "date": item.get("date") or "unknown-date",
+        "explanation": item.get("explanation", ""),
+        "media_type": item.get("media_type", "image"),
+        "hdurl": item.get("hdurl"),
+        "permalink": item.get("permalink") or item.get("url"),
+    }
+
+
+def fetch_single_date(d, max_retries=3, timeout=60):
+    """Fetch one APOD entry by date. Returns None if nothing was published
+    that day (e.g. a gap in the archive, or a date before APOD started).
+    """
+    legacy = _legacy_date_code(d)
+    url = f"{APOD_BASE}/{legacy}"
+    data = _http_get_json(url, max_retries=max_retries, timeout=timeout, allow_404=True)
+    if isinstance(data, list):
+        data = data[0] if data else None
+    return _normalize_entry(data)
+
+
+def fetch_date_range(start_date, end_date, max_retries=3, timeout=60):
+    """Fetch all APOD entries between two dates (inclusive), automatically
+    paginating through NASA's 25-item-per-page cap.
+    """
+    legacy_start = _legacy_date_code(start_date)
+    legacy_end = _legacy_date_code(end_date)
+
+    results = []
+    page = 1
+    while True:
+        params = {
+            "date_from": legacy_start,
+            "date_to": legacy_end,
+            "page": page,
+            "per_page": PER_PAGE_MAX,
+        }
+        url = f"{APOD_BASE}?{urllib.parse.urlencode(params)}"
+        if page > 1:
+            print(f"[INFO] Fetching page {page} of date range results...")
+        batch = _http_get_json(url, max_retries=max_retries, timeout=timeout)
+        if not batch:
+            break
+        results.extend(_normalize_entry(item) for item in batch)
+        if len(batch) < PER_PAGE_MAX:
+            break
+        page += 1
+        time.sleep(0.5)  # be polite between pages
+    return results
+
+
+def fetch_random(count, max_retries=3, timeout=60):
+    """Fetch N random APOD entries. NASA's new feed has no built-in random
+    picker, so this samples unique random dates since APOD began and fetches
+    each individually, skipping any date with nothing published. This means
+    one HTTP request per date, so large counts will take a while.
+    """
+    today = _date.today()
+    total_days = (today - APOD_START_DATE).days + 1
+    sample_size = min(count, total_days)
+    if sample_size < count:
+        print(f"[WARN]  Only {total_days} days of APOD archive exist; requesting all of them instead of {count}.")
+
+    offsets = random.sample(range(total_days), sample_size)
+
+    results = []
+    for i, offset in enumerate(offsets, 1):
+        d = APOD_START_DATE + _timedelta(days=offset)
+        entry = fetch_single_date(d, max_retries=max_retries, timeout=timeout)
+        if entry:
+            results.append(entry)
+        if i % 10 == 0 or i == sample_size:
+            print(f"[INFO] Checked {i}/{sample_size} random dates ({len(results)} found so far)...")
+        time.sleep(0.2)  # be polite between requests
+    return results
+
+
+def fetch_apod(date=None, start_date=None, end_date=None, count=None, max_retries=3, timeout=60):
+    """Fetch APOD entries from NASA's science.nasa.gov feed and return a
+    list of normalized entry dicts.
+    """
+    if count:
+        return fetch_random(count, max_retries=max_retries, timeout=timeout)
+
+    if start_date and end_date:
+        start = _date.fromisoformat(start_date)
+        end = _date.fromisoformat(end_date)
+        return fetch_date_range(start, end, max_retries=max_retries, timeout=timeout)
+
+    d = _date.fromisoformat(date) if date else _date.today()
+    entry = fetch_single_date(d, max_retries=max_retries, timeout=timeout)
+    return [entry] if entry else []
+
+
+def pick_url(entry):
+    """Return the downloadable image URL for an entry, or None if it isn't
+    a plain image (video/iframe embed) or has no image attached.
+    """
+    if entry.get("media_type") != "image":
+        return None
+    return entry.get("hdurl")
 
 
 def safe_filename(entry, url):
@@ -433,8 +473,8 @@ def save_metadata(entry, out_dir, base_name):
     with open(txt_path, "w", encoding="utf-8") as f:
         f.write(f"Title: {entry.get('title', 'N/A')}\n")
         f.write(f"Date: {entry.get('date', 'N/A')}\n")
-        if entry.get("copyright"):
-            f.write(f"Copyright: {entry.get('copyright')}\n")
+        if entry.get("permalink"):
+            f.write(f"Permalink: {entry.get('permalink')}\n")
         f.write(f"Media type: {entry.get('media_type', 'N/A')}\n\n")
         f.write(f"Explanation:\n{entry.get('explanation', 'N/A')}\n")
 
@@ -454,7 +494,6 @@ def run(args):
         sys.exit(1)
 
     entries = fetch_apod(
-        api_key=args.api_key,
         date=args.date,
         start_date=args.start_date,
         end_date=args.end_date,
@@ -464,7 +503,7 @@ def run(args):
     print(f"\nFound {len(entries)} entr{'y' if len(entries)==1 else 'ies'}.\n")
 
     downloaded = 0
-    skipped_videos = 0
+    skipped_non_image = 0
     skipped_text = 0
     skipped_overexposed = 0
     skipped_incomplete = 0
@@ -478,11 +517,12 @@ def run(args):
         media_type = entry.get("media_type", "image")
 
         if media_type != "image":
-            print(f"[SKIP]  {date} - '{title}' is a video, not an image ({entry.get('url')})")
-            skipped_videos += 1
+            print(f"[SKIP]  {date} - '{title}' is not a downloadable image "
+                  f"(media_type: {media_type}) ({entry.get('permalink')})")
+            skipped_non_image += 1
             continue
 
-        url = pick_url(entry, args.quality)
+        url = pick_url(entry)
         if not url:
             print(f"[SKIP]  {date} - '{title}' has no downloadable image URL")
             failed += 1
@@ -542,7 +582,7 @@ def run(args):
 
     print("\n--- Summary ---")
     print(f"Downloaded:            {downloaded}")
-    print(f"Skipped videos:        {skipped_videos}")
+    print(f"Skipped (non-image):   {skipped_non_image}")
     if args.exclude_text_images:
         print(f"Skipped (text):        {skipped_text}")
     if args.exclude_overexposed:
@@ -559,10 +599,9 @@ def run(args):
 
 def interactive_prompt():
     print("=== NASA APOD Downloader (interactive mode) ===\n")
+    print("(No API key needed - NASA's APOD feed is public.)\n")
 
-    api_key = input("API key (leave blank to use public DEMO_KEY): ").strip() or "DEMO_KEY"
-
-    print("\nWhat would you like to download?")
+    print("What would you like to download?")
     print("  1) Today's picture")
     print("  2) A specific date")
     print("  3) A date range")
@@ -580,7 +619,6 @@ def interactive_prompt():
     elif choice == "4":
         random_count = int(input("How many random pictures? ").strip())
 
-    quality = input("Quality - hd or sd? [hd]: ").strip().lower() or "hd"
     out_dir = input("Output folder [./nasa_apod]: ").strip() or "./nasa_apod"
     save_meta = (input("Save title/explanation metadata too? [y/N]: ").strip().lower() == "y")
 
@@ -612,12 +650,10 @@ def interactive_prompt():
         pass
 
     args = Args()
-    args.api_key = api_key
     args.date = date
     args.start_date = start_date
     args.end_date = end_date
     args.random = random_count
-    args.quality = "hd" if quality not in ("hd", "sd") else quality
     args.output = out_dir
     args.save_metadata = save_meta
     args.overwrite = False
@@ -635,17 +671,13 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
-    parser.add_argument("--api-key", default=os.environ.get("NASA_API_KEY", "DEMO_KEY"),
-                         help="Your NASA API key from https://api.nasa.gov/ (default: DEMO_KEY, or $NASA_API_KEY env var)")
     parser.add_argument("--date", help="Specific date, format YYYY-MM-DD")
     parser.add_argument("--start-date", help="Start date for a range, format YYYY-MM-DD")
     parser.add_argument("--end-date", help="End date for a range, format YYYY-MM-DD")
     parser.add_argument("--random", type=int, metavar="N", help="Download N random APOD entries")
-    parser.add_argument("--quality", choices=["hd", "sd"], default="hd",
-                         help="Image quality to download (default: hd)")
     parser.add_argument("-o", "--output", default="./nasa_apod", help="Output directory (default: ./nasa_apod)")
     parser.add_argument("--save-metadata", action="store_true",
-                         help="Also save a .json and .txt with title/explanation/copyright for each image")
+                         help="Also save a .json and .txt with title/explanation/permalink for each image")
     parser.add_argument("--overwrite", action="store_true", help="Re-download files that already exist")
     parser.add_argument("--exclude-text-images", action="store_true",
                          help="Skip images that look like diagrams/star-charts/text-heavy graphics "
@@ -671,15 +703,6 @@ def main():
 
     if args.interactive or len(sys.argv) == 1:
         args = interactive_prompt()
-
-    if args.api_key == "DEMO_KEY":
-        print("[INFO] Using the public DEMO_KEY:")
-        print("         - 30 requests/hour per IP address")
-        print("         - 50 requests/day per IP address")
-        print("       A free registered API key raises this to 1,000 requests/hour (no daily cap).")
-        print("       Get one at https://api.nasa.gov/ and pass it with --api-key YOUR_KEY\n")
-    else:
-        print("[INFO] Using a registered API key: up to 1,000 requests/hour per key (no daily cap).\n")
 
     run(args)
 
