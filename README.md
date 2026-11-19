@@ -104,4 +104,4 @@ Run `python nasa_apod_downloader.py --help` for full details at any time.
 
 ## License
 
-MIT (or your license of choice).
+MIT
