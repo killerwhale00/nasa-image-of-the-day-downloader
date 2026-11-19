@@ -36,7 +36,6 @@ cd downloads
 ```
 ## Then do
 ```bash
-
 python nasa_apod_downloader.py
 ```
 
