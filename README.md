@@ -35,7 +35,7 @@ A command-line tool for downloading images from NASA's [Astronomy Picture of the
 cd downloads
 
 ```
-
+## Then do
 ```bash
 
 python nasa_apod_downloader.py
